@@ -1,0 +1,176 @@
+#include <ros/ros.h>
+#include <actionlib/client/simple_action_client.h>
+#include <costmap_2d/costmap_2d_ros.h>
+#include <costmap_2d/costmap_2d.h>
+
+#include <geometry_msgs/PolygonStamped.h>
+#include <geometry_msgs/PointStamped.h>
+
+#include <frontier_exploration/geometry_tools.h>
+
+#include <frontier_exploration/ExploreTaskAction.h>
+#include <frontier_exploration/ExploreTaskActionGoal.h>
+#include <frontier_exploration/GetNextFrontier.h>
+#include <frontier_exploration/UpdateBoundaryPolygon.h>
+#include <costmap_2d/footprint.h>
+
+#include <nav_msgs/OccupancyGrid.h>
+
+
+#include <move_base_msgs/MoveBaseAction.h>
+
+#include <visualization_msgs/Marker.h>
+#include <boost/foreach.hpp>
+
+
+namespace frontier_exploration{
+
+/**
+ * @brief Client for FrontierExplorationServer that receives map from topic, and autonomous creates boundary polygon for frontier exploration
+ */
+class FrontierExplorationClientAuto{
+
+private:
+
+    ros::NodeHandle nh_;
+    ros::NodeHandle private_nh_;
+    ros::Subscriber map_sub_;
+
+    ros::Publisher point_viz_pub_;
+    ros::WallTimer point_viz_timer_;
+    //geometry_msgs::PolygonStamped input_;
+    geometry_msgs::PolygonStamped polygon_area; 
+    geometry_msgs::Point point;
+    bool waiting_for_center_;
+    uint map_width_;
+    uint map_height_;
+
+    /**
+     * @brief Publish markers for visualization of points for boundary polygon.
+     */
+    void vizPubCb(){
+
+        visualization_msgs::Marker points, line_strip;
+
+        points.header = line_strip.header = polygon_area.header;
+        points.ns = line_strip.ns = "explore_points";
+
+        points.id = 0;
+        line_strip.id = 1;
+
+        points.type = visualization_msgs::Marker::SPHERE_LIST;
+        line_strip.type = visualization_msgs::Marker::LINE_STRIP;
+
+        if(!polygon_area.polygon.points.empty()){
+
+            points.action = line_strip.action = visualization_msgs::Marker::ADD;
+            points.pose.orientation.w = line_strip.pose.orientation.w = 1.0;
+
+            points.scale.x = points.scale.y = 0.1;
+            line_strip.scale.x = 0.05;
+
+            BOOST_FOREACH(geometry_msgs::Point32 point, polygon_area.polygon.points){
+                line_strip.points.push_back(costmap_2d::toPoint(point));
+                points.points.push_back(costmap_2d::toPoint(point));
+            }
+
+            if(waiting_for_center_){
+                line_strip.points.push_back(costmap_2d::toPoint(polygon_area.polygon.points.front()));
+                points.color.a = points.color.r = line_strip.color.r = line_strip.color.a = 1.0;
+            }else{
+                points.color.a = points.color.b = line_strip.color.b = line_strip.color.a = 1.0;
+            }
+        }else{
+            points.action = line_strip.action = visualization_msgs::Marker::DELETE;
+        }
+        point_viz_pub_.publish(points);
+        point_viz_pub_.publish(line_strip);
+
+    }
+
+    /**
+     * @brief Build boundary polygon from map received through map topic.
+     * @param map Received map from any type of mapping algorithm
+     */
+    void mapCB(const nav_msgs::OccupancyGridConstPtr& map)
+    {
+        if(map_width_ == map->info.width && map_height_ == map->info.height)
+            return;
+        
+        // Get basic map info
+        float resolution = map->info.resolution;
+        map_width_ = map->info.width;
+        map_height_ = map->info.height;
+        if(map_width_ <= 20 || map_height_ <= 20)
+        {
+            ROS_WARN("The size of map is too small !! SKIP");
+            return;
+        }
+        waiting_for_center_ = false;
+        // Find the corner of map (boundary zone is 10 cell)
+        //float bound_zone = 10*resolution;
+        float bound_zone = 0;     //wlf add
+        float max_x = map_width_*resolution + map->info.origin.position.x - bound_zone;
+        float max_y = map_height_*resolution + map->info.origin.position.y - bound_zone;
+        float min_x = map->info.origin.position.x + bound_zone;
+        float min_y = map->info.origin.position.y + bound_zone;
+
+        // Push the points into the polygon vector
+
+        polygon_area.polygon.points.clear();
+        polygon_area.header = map->header;
+
+        point.z = 0;
+        point.x = min_x;
+        point.y = min_y;
+        polygon_area.polygon.points.push_back(costmap_2d::toPoint32(point));
+        point.x = max_x;
+        polygon_area.polygon.points.push_back(costmap_2d::toPoint32(point));
+        point.y = max_y;
+        polygon_area.polygon.points.push_back(costmap_2d::toPoint32(point));
+        point.x = min_x;
+        polygon_area.polygon.points.push_back(costmap_2d::toPoint32(point));
+        waiting_for_center_ = true;
+        actionlib::SimpleActionClient<frontier_exploration::ExploreTaskAction> exploreClient("explore_server", true);
+        exploreClient.waitForServer();
+        ROS_INFO("Sending goal");
+        frontier_exploration::ExploreTaskGoal goal;
+        goal.explore_center.header = map->header;
+        point.x = 0.0;
+        point.y = 0.0;
+        goal.explore_center.point = point;
+        goal.explore_boundary = polygon_area;
+        exploreClient.sendGoal(goal);
+
+    } //end of mapCB
+
+public:
+
+    /**
+     * @brief Constructor for the client.
+     */
+    FrontierExplorationClientAuto() :
+        nh_(),
+        private_nh_("~"),
+        map_width_(0),
+        map_height_(0),
+        waiting_for_center_(false)
+    {
+        map_sub_ = nh_.subscribe("/map", 1, &FrontierExplorationClientAuto::mapCB, this);
+        point_viz_pub_ = nh_.advertise<visualization_msgs::Marker>("exploration_polygon_marker", 10);
+        point_viz_timer_ = nh_.createWallTimer(ros::WallDuration(0.1), boost::bind(&FrontierExplorationClientAuto::vizPubCb, this));
+        ROS_INFO("Start autonomous map exploration");
+    }    
+
+}; // end of class
+
+}// end of namespace
+
+int main(int argc, char** argv)
+{
+    ros::init(argc, argv, "explore_client_auto");
+
+    frontier_exploration::FrontierExplorationClientAuto client_auto;
+    ros::spin();
+    return 0;
+}
